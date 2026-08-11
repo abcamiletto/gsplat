@@ -7176,7 +7176,6 @@ def test_rasterize_to_pixels_3dgs_masked_tile_outputs_initialized(packed: bool, 
         flatten_ids,
         packed,
         False,  # absgrad
-        0,  # classic rasterization
     )
 
     torch.testing.assert_close(

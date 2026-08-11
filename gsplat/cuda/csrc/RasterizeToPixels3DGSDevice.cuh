@@ -31,20 +31,7 @@ namespace gsplat
 constexpr float ANALYTIC_CDF_LINEAR     = 1.6f;
 constexpr float ANALYTIC_CDF_CUBIC      = 0.07f;
 constexpr float ANALYTIC_MIN_EIGENVALUE = 1e-12f;
-constexpr float TWO_PI                  = 6.283185307179586f;
-
-template<typename Function>
-void dispatch_rasterize_mode(const RasterizeMode mode, Function &function)
-{
-    if(mode == RasterizeMode::CLASSIC)
-    {
-        function.template operator()<RasterizeMode::CLASSIC>();
-    }
-    else
-    {
-        function.template operator()<RasterizeMode::ANALYTIC>();
-    }
-}
+constexpr float ANALYTIC_TWO_PI         = 6.283185307179586f;
 
 template<RasterizeMode Mode>
 struct GaussianRasterParams;
@@ -95,6 +82,13 @@ __device__ __forceinline__ float analytic_normal_cdf(const float x)
     return 0.5f * tanhf(0.5f * polynomial) + 0.5f;
 }
 
+__device__ __forceinline__ float eval_axis_integral_value(const float position, const float sigma)
+{
+    const float upper = (position + 0.5f) / sigma;
+    const float lower = (position - 0.5f) / sigma;
+    return sigma * (analytic_normal_cdf(upper) - analytic_normal_cdf(lower));
+}
+
 struct AxisIntegral
 {
     float value;
@@ -133,13 +127,13 @@ __device__ __forceinline__ float eval_gaussian_response(
     }
     else
     {
-        const float sin_theta = params.frame.x;
-        const float cos_theta = params.frame.y;
-        const float u         = -sin_theta * dx + cos_theta * dy;
-        const float v         = cos_theta * dx + sin_theta * dy;
-        const AxisIntegral iu = eval_axis_integral(u, params.frame.z);
-        const AxisIntegral iv = eval_axis_integral(v, params.frame.w);
-        return TWO_PI * iu.value * iv.value;
+        const float sin_theta  = params.frame.x;
+        const float cos_theta  = params.frame.y;
+        const float u          = -sin_theta * dx + cos_theta * dy;
+        const float v          = cos_theta * dx + sin_theta * dy;
+        const float integral_u = eval_axis_integral_value(u, params.frame.z);
+        const float integral_v = eval_axis_integral_value(v, params.frame.w);
+        return ANALYTIC_TWO_PI * integral_u * integral_v;
     }
 }
 
@@ -208,10 +202,10 @@ __device__ __forceinline__ void gaussian_response_vjp(
         const float v             = cos_theta * delta.x + sin_theta * delta.y;
         const AxisIntegral iu     = eval_axis_integral(u, sigma_major);
         const AxisIntegral iv     = eval_axis_integral(v, sigma_minor);
-        const float v_u           = v_response * TWO_PI * iv.value * iu.v_position;
-        const float v_v           = v_response * TWO_PI * iu.value * iv.v_position;
-        const float v_sigma_major = v_response * TWO_PI * iv.value * iu.v_sigma;
-        const float v_sigma_minor = v_response * TWO_PI * iu.value * iv.v_sigma;
+        const float v_u           = v_response * ANALYTIC_TWO_PI * iv.value * iu.v_position;
+        const float v_v           = v_response * ANALYTIC_TWO_PI * iu.value * iv.v_position;
+        const float v_sigma_major = v_response * ANALYTIC_TWO_PI * iv.value * iu.v_sigma;
+        const float v_sigma_minor = v_response * ANALYTIC_TWO_PI * iu.value * iv.v_sigma;
 
         v_delta = {
             -sin_theta * v_u + cos_theta * v_v,
