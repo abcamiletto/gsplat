@@ -22,9 +22,12 @@ def _analytic_reference(means2d, conics, colors, opacities, width, height):
     center = 0.5 * (conic[0] + conic[2])
     half_diff = 0.5 * (conic[0] - conic[2])
     radius = torch.hypot(half_diff, conic[1])
+    eigenvalue_large = center + radius
+    determinant = conic[0] * conic[2] - conic[1].square()
+    eigenvalue_small = torch.clamp_min(determinant / eigenvalue_large, 1e-12)
     theta = 0.5 * torch.atan2(conic[1], half_diff)
-    sigma_major = torch.rsqrt(center - radius)
-    sigma_minor = torch.rsqrt(center + radius)
+    sigma_major = torch.rsqrt(eigenvalue_small)
+    sigma_minor = torch.rsqrt(eigenvalue_large)
 
     ys, xs = torch.meshgrid(
         torch.arange(height, device=mean.device, dtype=mean.dtype) + 0.5,

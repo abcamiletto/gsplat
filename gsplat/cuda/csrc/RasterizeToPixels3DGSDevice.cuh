@@ -28,9 +28,10 @@
 
 namespace gsplat
 {
-constexpr float ANALYTIC_CDF_LINEAR = 1.6f;
-constexpr float ANALYTIC_CDF_CUBIC  = 0.07f;
-constexpr float TWO_PI              = 6.283185307179586f;
+constexpr float ANALYTIC_CDF_LINEAR     = 1.6f;
+constexpr float ANALYTIC_CDF_CUBIC      = 0.07f;
+constexpr float ANALYTIC_MIN_EIGENVALUE = 1e-12f;
+constexpr float TWO_PI                  = 6.283185307179586f;
 
 template<typename Function>
 void dispatch_rasterize_mode(const RasterizeMode mode, Function &function)
@@ -70,15 +71,18 @@ __device__ __forceinline__ GaussianRasterParams<Mode> prepare_gaussian_raster_pa
     }
     else
     {
-        const float center    = 0.5f * (conic.x + conic.z);
-        const float half_diff = 0.5f * (conic.x - conic.z);
-        const float radius    = hypotf(half_diff, conic.y);
-        const float theta     = 0.5f * atan2f(conic.y, half_diff);
+        const float center           = 0.5f * (conic.x + conic.z);
+        const float half_diff        = 0.5f * (conic.x - conic.z);
+        const float radius           = hypotf(half_diff, conic.y);
+        const float eigenvalue_large = center + radius;
+        const float determinant      = fmaf(conic.x, conic.z, -conic.y * conic.y);
+        const float eigenvalue_small = fmaxf(determinant / eigenvalue_large, ANALYTIC_MIN_EIGENVALUE);
+        const float theta            = 0.5f * atan2f(conic.y, half_diff);
         float sin_theta;
         float cos_theta;
         sincosf(theta, &sin_theta, &cos_theta);
-        const float sigma_major = rsqrtf(center - radius);
-        const float sigma_minor = rsqrtf(center + radius);
+        const float sigma_major = rsqrtf(eigenvalue_small);
+        const float sigma_minor = rsqrtf(eigenvalue_large);
         return {
             conic, {sin_theta, cos_theta, sigma_major, sigma_minor}
         };
@@ -214,27 +218,32 @@ __device__ __forceinline__ void gaussian_response_vjp(
             cos_theta * v_u + sin_theta * v_v,
         };
 
-        const float center        = 0.5f * (conic.x + conic.z);
-        const float half_diff     = 0.5f * (conic.x - conic.z);
-        const float radius_sq     = half_diff * half_diff + conic.y * conic.y;
-        const float radius        = sqrtf(radius_sq);
-        const float v_eigen_major = -0.5f * sigma_major * sigma_major * sigma_major * v_sigma_major;
-        const float v_eigen_minor = -0.5f * sigma_minor * sigma_minor * sigma_minor * v_sigma_minor;
+        const float center             = 0.5f * (conic.x + conic.z);
+        const float half_diff          = 0.5f * (conic.x - conic.z);
+        const float radius_sq          = half_diff * half_diff + conic.y * conic.y;
+        const float radius             = sqrtf(radius_sq);
+        const float eigenvalue_large   = center + radius;
+        const float determinant        = fmaf(conic.x, conic.z, -conic.y * conic.y);
+        const float eigenvalue_small   = determinant / eigenvalue_large;
+        const float v_eigenvalue_small = eigenvalue_small > ANALYTIC_MIN_EIGENVALUE
+                                           ? -0.5f * sigma_major * sigma_major * sigma_major * v_sigma_major
+                                           : 0.f;
+        const float v_eigenvalue_large = -0.5f * sigma_minor * sigma_minor * sigma_minor * v_sigma_minor
+                                       - v_eigenvalue_small * eigenvalue_small / eigenvalue_large;
+        const float v_determinant      = v_eigenvalue_small / eigenvalue_large;
 
         float v_half_diff = 0.f;
         float v_offdiag   = 0.f;
         if(radius_sq > 1e-12f * center * center)
         {
-            const float v_radius = v_eigen_minor - v_eigen_major;
-            const float v_theta  = -v * v_u + u * v_v;
-            v_half_diff          = half_diff / radius * v_radius - 0.5f * conic.y / radius_sq * v_theta;
-            v_offdiag            = conic.y / radius * v_radius + 0.5f * half_diff / radius_sq * v_theta;
+            const float v_theta = -v * v_u + u * v_v;
+            v_half_diff         = half_diff / radius * v_eigenvalue_large - 0.5f * conic.y / radius_sq * v_theta;
+            v_offdiag           = conic.y / radius * v_eigenvalue_large + 0.5f * half_diff / radius_sq * v_theta;
         }
 
-        const float v_center = v_eigen_major + v_eigen_minor;
-        v_conic.x            = 0.5f * (v_center + v_half_diff);
-        v_conic.z            = 0.5f * (v_center - v_half_diff);
-        v_conic.y            = v_offdiag;
+        v_conic.x = 0.5f * (v_eigenvalue_large + v_half_diff) + conic.z * v_determinant;
+        v_conic.z = 0.5f * (v_eigenvalue_large - v_half_diff) + conic.x * v_determinant;
+        v_conic.y = v_offdiag - 2.f * conic.y * v_determinant;
     }
 }
 
