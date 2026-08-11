@@ -61,7 +61,8 @@ RasterizeToPixels3DGSResult rasterize_to_pixels_3dgs(
     const at::Tensor &isect_offsets,
     const at::Tensor &flatten_ids,
     bool packed,
-    bool absgrad
+    bool absgrad,
+    RasterizeMode rasterize_mode
 );
 
 // Public outputs of rasterize_to_pixels_2dgs (excludes the internal
@@ -111,6 +112,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
+    const RasterizeMode rasterize_mode,
     // intersections
     const at::Tensor isect_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids,   // [n_isects]
@@ -132,6 +134,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernels(
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
+    const RasterizeMode rasterize_mode,
     // intersections
     const at::Tensor isect_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids,   // [n_isects]
@@ -153,6 +156,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
+    const RasterizeMode rasterize_mode,
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
@@ -182,6 +186,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernels(
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
+    const RasterizeMode rasterize_mode,
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]

@@ -38,7 +38,7 @@ using SupportedChannels = dispatch::IntParam<GSPLAT_NUM_CHANNELS>;
 
 namespace cg = cooperative_groups;
 
-template<uint32_t CDIM, typename scalar_t>
+template<RasterizeMode Mode, uint32_t CDIM, typename scalar_t>
 __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     const uint32_t I,
     const uint32_t N,
@@ -126,10 +126,11 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     const uint32_t num_batches = (range_end - range_start + block_size - 1) / block_size;
 
     extern __shared__ int s[];
-    int32_t *id_batch      = (int32_t *)s;                                            // [block_size]
-    vec3 *xy_opacity_batch = reinterpret_cast<vec3 *>(&id_batch[block_size]);         // [block_size]
-    vec3 *conic_batch      = reinterpret_cast<vec3 *>(&xy_opacity_batch[block_size]); // [block_size]
-    float *rgbs_batch      = (float *)&conic_batch[block_size];                       // [block_size * CDIM]
+    int32_t *id_batch          = (int32_t *)s;                                    // [block_size]
+    vec3 *xy_opacity_batch     = reinterpret_cast<vec3 *>(&id_batch[block_size]); // [block_size]
+    using RasterParams         = GaussianRasterParams<Mode>;
+    RasterParams *params_batch = reinterpret_cast<RasterParams *>(&xy_opacity_batch[block_size]); // [block_size]
+    float *rgbs_batch          = (float *)&params_batch[block_size];                              // [block_size * CDIM]
 
     // this is the T AFTER the last gaussian in this pixel
     float T_final           = 1.0f - render_alphas[pix_id];
@@ -173,7 +174,7 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
             const vec2 xy        = means2d[g];
             const float opac     = opacities[g];
             xy_opacity_batch[tr] = {xy.x, xy.y, opac};
-            conic_batch[tr]      = conics[g];
+            params_batch[tr]     = prepare_gaussian_raster_params<Mode>(conics[g]);
 #    pragma unroll
             for(uint32_t k = 0; k < CDIM; ++k)
             {
@@ -194,17 +195,17 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
             float alpha;
             float opac;
             vec2 delta;
-            vec3 conic;
-            float vis;
+            float response;
+            RasterParams params;
 
             if(valid)
             {
-                conic                   = conic_batch[t];
+                params                  = params_batch[t];
                 vec3 xy_opac            = xy_opacity_batch[t];
                 opac                    = xy_opac.z;
                 delta                   = {xy_opac.x - px, xy_opac.y - py};
-                const GaussianWeight gw = eval_gaussian_weight(conic, delta.x, delta.y, opac);
-                vis                     = gw.vis;
+                const GaussianWeight gw = eval_gaussian_weight<Mode>(params, delta.x, delta.y, opac);
+                response                = gw.response;
                 alpha                   = gw.alpha;
                 if(!gw.valid)
                 {
@@ -256,21 +257,14 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                     v_alpha += -T_final * ra * accum;
                 }
 
-                if(opac * vis <= MAX_ALPHA)
+                if(opac * response <= MAX_ALPHA)
                 {
-                    const float v_sigma = -opac * vis * v_alpha;
-                    v_conic_local
-                        = {0.5f * v_sigma * delta.x * delta.x,
-                           v_sigma * delta.x * delta.y,
-                           0.5f * v_sigma * delta.y * delta.y};
-                    v_xy_local
-                        = {v_sigma * (conic.x * delta.x + conic.y * delta.y),
-                           v_sigma * (conic.y * delta.x + conic.z * delta.y)};
+                    gaussian_response_vjp<Mode>(params, delta, response, opac * v_alpha, v_conic_local, v_xy_local);
                     if(v_means2d_abs != nullptr)
                     {
                         v_xy_abs_local = {abs(v_xy_local.x), abs(v_xy_local.y)};
                     }
-                    v_opacity_local = vis * v_alpha;
+                    v_opacity_local = response * v_alpha;
                 }
 
 #    pragma unroll
@@ -331,6 +325,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
+    const RasterizeMode rasterize_mode,
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
@@ -380,51 +375,61 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     auto launch_kernel = [&]<typename ChannelsT>()
     {
         constexpr uint32_t CDIM = ChannelsT::value;
-
-        int64_t shmem_size
-            = tile_size * tile_size * (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3) + sizeof(float) * CDIM);
-
-        if(cudaFuncSetAttribute(
-               rasterize_to_pixels_3dgs_bwd_kernel<CDIM, float>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size
-           )
-           != cudaSuccess)
+        auto launch_mode        = [&]<RasterizeMode Mode>()
         {
-            AT_ERROR(
-                "Failed to set maximum shared memory size (requested ", shmem_size, " bytes), try lowering tile_size."
-            );
-        }
+            using RasterParams       = GaussianRasterParams<Mode>;
+            const int64_t shmem_size = tile_size
+                                     * tile_size
+                                     * (sizeof(int32_t) + sizeof(vec3) + sizeof(RasterParams) + sizeof(float) * CDIM);
 
-        rasterize_to_pixels_3dgs_bwd_kernel<CDIM, float>
-            <<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
-                I,
-                N,
-                n_isects,
-                packed,
-                reinterpret_cast<const vec2 *>(means2d.const_data_ptr<float>()),
-                reinterpret_cast<const vec3 *>(conics.const_data_ptr<float>()),
-                colors.const_data_ptr<float>(),
-                opacities.const_data_ptr<float>(),
-                backgrounds.has_value() ? backgrounds.value().const_data_ptr<float>() : nullptr,
-                masks.has_value() ? masks.value().const_data_ptr<bool>() : nullptr,
-                image_width,
-                image_height,
-                tile_size,
-                tile_width,
-                tile_height,
-                0,
-                tile_offsets.const_data_ptr<int32_t>(),
-                flatten_ids.const_data_ptr<int32_t>(),
-                render_alphas.const_data_ptr<float>(),
-                last_ids.const_data_ptr<int32_t>(),
-                v_render_colors.const_data_ptr<float>(),
-                v_render_alphas.const_data_ptr<float>(),
-                v_means2d_abs.has_value() ? reinterpret_cast<vec2 *>(v_means2d_abs.value().data_ptr<float>()) : nullptr,
-                reinterpret_cast<vec2 *>(v_means2d.data_ptr<float>()),
-                reinterpret_cast<vec3 *>(v_conics.data_ptr<float>()),
-                v_colors.data_ptr<float>(),
-                v_opacities.data_ptr<float>()
-            );
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+            if(cudaFuncSetAttribute(
+                   rasterize_to_pixels_3dgs_bwd_kernel<Mode, CDIM, float>,
+                   cudaFuncAttributeMaxDynamicSharedMemorySize,
+                   shmem_size
+               )
+               != cudaSuccess)
+            {
+                AT_ERROR(
+                    "Failed to set maximum shared memory size (requested ",
+                    shmem_size,
+                    " bytes), try lowering tile_size."
+                );
+            }
+
+            rasterize_to_pixels_3dgs_bwd_kernel<Mode, CDIM, float>
+                <<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
+                    I,
+                    N,
+                    n_isects,
+                    packed,
+                    reinterpret_cast<const vec2 *>(means2d.const_data_ptr<float>()),
+                    reinterpret_cast<const vec3 *>(conics.const_data_ptr<float>()),
+                    colors.const_data_ptr<float>(),
+                    opacities.const_data_ptr<float>(),
+                    backgrounds.has_value() ? backgrounds.value().const_data_ptr<float>() : nullptr,
+                    masks.has_value() ? masks.value().const_data_ptr<bool>() : nullptr,
+                    image_width,
+                    image_height,
+                    tile_size,
+                    tile_width,
+                    tile_height,
+                    0,
+                    tile_offsets.const_data_ptr<int32_t>(),
+                    flatten_ids.const_data_ptr<int32_t>(),
+                    render_alphas.const_data_ptr<float>(),
+                    last_ids.const_data_ptr<int32_t>(),
+                    v_render_colors.const_data_ptr<float>(),
+                    v_render_alphas.const_data_ptr<float>(),
+                    v_means2d_abs.has_value() ? reinterpret_cast<vec2 *>(v_means2d_abs.value().data_ptr<float>())
+                                              : nullptr,
+                    reinterpret_cast<vec2 *>(v_means2d.data_ptr<float>()),
+                    reinterpret_cast<vec3 *>(v_conics.data_ptr<float>()),
+                    v_colors.data_ptr<float>(),
+                    v_opacities.data_ptr<float>()
+                );
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        };
+        dispatch_rasterize_mode(rasterize_mode, launch_mode);
     };
     const bool dispatched = dispatch::dispatch(SupportedChannels{channels}, std::move(launch_kernel));
     TORCH_CHECK(dispatched, "dispatch failed: no matching compile-time instantiation for runtime parameters");
@@ -442,6 +447,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernels(
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
+    const RasterizeMode rasterize_mode,
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
@@ -487,66 +493,71 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernels(
     auto launch_kernels = [&]<typename ChannelsT>()
     {
         constexpr uint32_t CDIM = ChannelsT::value;
-
-        int64_t shmem_size
-            = tile_size * tile_size * (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3) + sizeof(float) * CDIM);
-
-        for(const auto device_id: c10::irange(c10::cuda::device_count()))
+        auto launch_mode        = [&]<RasterizeMode Mode>()
         {
-            C10_CUDA_CHECK(cudaSetDevice(device_id));
-            if(cudaFuncSetAttribute(
-                   rasterize_to_pixels_3dgs_bwd_kernel<CDIM, float>,
-                   cudaFuncAttributeMaxDynamicSharedMemorySize,
-                   shmem_size
-               )
-               != cudaSuccess)
-            {
-                AT_ERROR(
-                    "Failed to set maximum shared memory size (requested ",
-                    shmem_size,
-                    " bytes), try lowering tile_size."
-                );
-            }
-            auto stream = c10::cuda::getCurrentCUDAStream(device_id);
+            using RasterParams       = GaussianRasterParams<Mode>;
+            const int64_t shmem_size = tile_size
+                                     * tile_size
+                                     * (sizeof(int32_t) + sizeof(vec3) + sizeof(RasterParams) + sizeof(float) * CDIM);
 
-            int64_t block_offset, block_count;
-            std::tie(block_offset, block_count) = chunk(n_tiles, device_id);
-            if(block_count > 0)
+            for(const auto device_id: c10::irange(c10::cuda::device_count()))
             {
-                dim3 grid = {static_cast<uint32_t>(block_count), 1, 1};
-                rasterize_to_pixels_3dgs_bwd_kernel<CDIM, float><<<grid, threads, shmem_size, stream>>>(
-                    I,
-                    N,
-                    n_isects,
-                    packed,
-                    reinterpret_cast<const vec2 *>(means2d.const_data_ptr<float>()),
-                    reinterpret_cast<const vec3 *>(conics.const_data_ptr<float>()),
-                    colors.const_data_ptr<float>(),
-                    opacities.const_data_ptr<float>(),
-                    backgrounds.has_value() ? backgrounds.value().const_data_ptr<float>() : nullptr,
-                    masks.has_value() ? masks.value().const_data_ptr<bool>() : nullptr,
-                    image_width,
-                    image_height,
-                    tile_size,
-                    tile_width,
-                    tile_height,
-                    block_offset,
-                    tile_offsets.const_data_ptr<int32_t>(),
-                    flatten_ids.const_data_ptr<int32_t>(),
-                    render_alphas.const_data_ptr<float>(),
-                    last_ids.const_data_ptr<int32_t>(),
-                    v_render_colors.const_data_ptr<float>(),
-                    v_render_alphas.const_data_ptr<float>(),
-                    v_means2d_abs.has_value() ? reinterpret_cast<vec2 *>(v_means2d_abs.value().data_ptr<float>())
-                                              : nullptr,
-                    reinterpret_cast<vec2 *>(v_means2d.data_ptr<float>()),
-                    reinterpret_cast<vec3 *>(v_conics.data_ptr<float>()),
-                    v_colors.data_ptr<float>(),
-                    v_opacities.data_ptr<float>()
-                );
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
+                C10_CUDA_CHECK(cudaSetDevice(device_id));
+                if(cudaFuncSetAttribute(
+                       rasterize_to_pixels_3dgs_bwd_kernel<Mode, CDIM, float>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       shmem_size
+                   )
+                   != cudaSuccess)
+                {
+                    AT_ERROR(
+                        "Failed to set maximum shared memory size (requested ",
+                        shmem_size,
+                        " bytes), try lowering tile_size."
+                    );
+                }
+                auto stream = c10::cuda::getCurrentCUDAStream(device_id);
+
+                int64_t block_offset, block_count;
+                std::tie(block_offset, block_count) = chunk(n_tiles, device_id);
+                if(block_count > 0)
+                {
+                    dim3 grid = {static_cast<uint32_t>(block_count), 1, 1};
+                    rasterize_to_pixels_3dgs_bwd_kernel<Mode, CDIM, float><<<grid, threads, shmem_size, stream>>>(
+                        I,
+                        N,
+                        n_isects,
+                        packed,
+                        reinterpret_cast<const vec2 *>(means2d.const_data_ptr<float>()),
+                        reinterpret_cast<const vec3 *>(conics.const_data_ptr<float>()),
+                        colors.const_data_ptr<float>(),
+                        opacities.const_data_ptr<float>(),
+                        backgrounds.has_value() ? backgrounds.value().const_data_ptr<float>() : nullptr,
+                        masks.has_value() ? masks.value().const_data_ptr<bool>() : nullptr,
+                        image_width,
+                        image_height,
+                        tile_size,
+                        tile_width,
+                        tile_height,
+                        block_offset,
+                        tile_offsets.const_data_ptr<int32_t>(),
+                        flatten_ids.const_data_ptr<int32_t>(),
+                        render_alphas.const_data_ptr<float>(),
+                        last_ids.const_data_ptr<int32_t>(),
+                        v_render_colors.const_data_ptr<float>(),
+                        v_render_alphas.const_data_ptr<float>(),
+                        v_means2d_abs.has_value() ? reinterpret_cast<vec2 *>(v_means2d_abs.value().data_ptr<float>())
+                                                  : nullptr,
+                        reinterpret_cast<vec2 *>(v_means2d.data_ptr<float>()),
+                        reinterpret_cast<vec3 *>(v_conics.data_ptr<float>()),
+                        v_colors.data_ptr<float>(),
+                        v_opacities.data_ptr<float>()
+                    );
+                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+                }
             }
-        }
+        };
+        dispatch_rasterize_mode(rasterize_mode, launch_mode);
     };
     const bool dispatched = dispatch::dispatch(SupportedChannels{channels}, std::move(launch_kernels));
     TORCH_CHECK(

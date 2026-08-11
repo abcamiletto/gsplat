@@ -62,7 +62,7 @@ _POST_CODE = {"none": 0, "shift": 1, "shift_relu": 2}
 # Gaussian depth modes (D/ED): use projection depth (controlled by global_z_order)
 # Hit distance modes (d/Ed): compute along-ray distance in rasterization
 RenderMode = Literal["RGB", "d", "Ed", "D", "ED", "RGB-d", "RGB-Ed", "RGB+D", "RGB+ED"]
-RasterizeMode = Literal["classic", "antialiased"]
+RasterizeMode = Literal["classic", "antialiased", "analytic"]
 
 
 class RendererConfig:
@@ -246,7 +246,7 @@ def rasterization(
     near_plane: float = 0.01,
     far_plane: float = 1e10,
     radius_clip: float = 0.0,
-    eps2d: float = 0.3,
+    eps2d: Optional[float] = None,
     sh_degree: Optional[int] = None,
     packed: bool = True,
     tile_size: Optional[int] = None,
@@ -412,9 +412,8 @@ def rasterization(
         radius_clip: Gaussians with 2D radius smaller or equal than this value will be
             skipped. This is extremely helpful for speeding up large scale scenes.
             Default is 0.0.
-        eps2d: An epsilon added to the egienvalues of projected 2D covariance matrices.
-            This will prevents the projected GS to be too small. For example eps2d=0.3
-            leads to minimal 3 pixel unit. Default is 0.3.
+        eps2d: An epsilon added to the eigenvalues of projected 2D covariance matrices.
+            Defaults to 0.0 for analytical rasterization and 0.3 otherwise.
         sh_degree: The SH degree to use, which can be smaller than the total
             number of bands. If set, the `colors` should be [N, K, D] SH coefficients (shared
             across batch/camera dims), else the `colors` should be [..., (C,) N, D]
@@ -434,8 +433,10 @@ def rasterization(
         absgrad: If true, the absolute gradients of the projected 2D means
             will be computed during the backward pass, which could be accessed by
             `meta["means2d"].absgrad`. Default is False.
-        rasterize_mode: The rasterization mode. Supported modes are "classic" and
-            "antialiased". Default is "classic".
+        rasterize_mode: The rasterization mode. "classic" samples each Gaussian at
+            the pixel center, "antialiased" additionally applies Mip-Splatting opacity
+            compensation, and "analytic" integrates an analytical approximation over
+            the pixel area. Default is "classic".
         channel_chunk: The number of channels to render in one go. Default is 32.
             If the required rendering channels are larger than this value, the rendering
             will be done looply in chunks.
@@ -518,6 +519,11 @@ def rasterization(
 
     """
     has_color = render_mode_has_color(render_mode)
+
+    if rasterize_mode not in ("classic", "antialiased", "analytic"):
+        raise ValueError(f"Unknown rasterize_mode: {rasterize_mode!r}")
+    if eps2d is None:
+        eps2d = 0.0 if rasterize_mode == "analytic" else 0.3
 
     external_distortion_coeffs = cast(
         Optional[BivariateWindshieldModelParameters], external_distortion_coeffs
@@ -641,6 +647,7 @@ def rasterization(
         renderer_config_impl,
         process_group_name,
         world_size,
+        rasterize_mode == "analytic",
     )
 
     if absgrad and not with_eval3d:
@@ -781,6 +788,10 @@ def _rasterization(
     _validate_3dgut_rasterize_mode(
         rasterize_mode, with_ut=with_ut, with_eval3d=with_eval3d
     )
+    if rasterize_mode == "analytic":
+        raise ValueError(
+            "The PyTorch reference rasterizer does not support analytic mode."
+        )
 
     batch_dims = means.shape[:-2]
     num_batch_dims = len(batch_dims)

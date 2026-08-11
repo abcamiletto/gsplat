@@ -38,7 +38,7 @@ using SupportedChannels = dispatch::IntParam<GSPLAT_NUM_CHANNELS>;
 // Forward
 ////////////////////////////////////////////////////////////////
 
-template<uint32_t CDIM, uint32_t TILE_SIZE, uint32_t CTA_SIZE>
+template<RasterizeMode Mode, uint32_t CDIM, uint32_t TILE_SIZE, uint32_t CTA_SIZE>
 __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
     const uint32_t N,
     const uint32_t n_isects,
@@ -168,9 +168,10 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
     const uint32_t num_batches = (range_end - range_start + BATCH_SIZE - 1) / BATCH_SIZE;
 
     extern __shared__ int s[];
-    int32_t *id_batch      = (int32_t *)s;                                            // [BATCH_SIZE]
-    vec3 *xy_opacity_batch = reinterpret_cast<vec3 *>(&id_batch[BATCH_SIZE]);         // [BATCH_SIZE]
-    vec3 *conic_batch      = reinterpret_cast<vec3 *>(&xy_opacity_batch[BATCH_SIZE]); // [BATCH_SIZE]
+    int32_t *id_batch          = (int32_t *)s;                                    // [BATCH_SIZE]
+    vec3 *xy_opacity_batch     = reinterpret_cast<vec3 *>(&id_batch[BATCH_SIZE]); // [BATCH_SIZE]
+    using RasterParams         = GaussianRasterParams<Mode>;
+    RasterParams *params_batch = reinterpret_cast<RasterParams *>(&xy_opacity_batch[BATCH_SIZE]); // [BATCH_SIZE]
 
     // current visibility left to render
     // transmittance is gonna be used in the backward pass which requires a high
@@ -204,7 +205,7 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
             const vec2 xy         = means2d[g];
             const float opac      = opacities[g];
             xy_opacity_batch[tid] = {xy.x, xy.y, opac};
-            conic_batch[tid]      = conics[g];
+            params_batch[tid]     = prepare_gaussian_raster_params<Mode>(conics[g]);
         }
 
         // wait for other threads to collect the gaussians in batch. A CTA
@@ -222,10 +223,10 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
         const uint32_t batch_size = min(BATCH_SIZE, (uint32_t)range_end - batch_start);
         for(uint32_t t = 0; (t < batch_size) && (done_mask != ALL_DONE); ++t)
         {
-            const vec3 conic   = conic_batch[t];
-            const vec3 xy_opac = xy_opacity_batch[t];
-            const float opac   = xy_opac.z;
-            const float dx     = xy_opac.x - px;
+            const RasterParams params = params_batch[t];
+            const vec3 xy_opac        = xy_opacity_batch[t];
+            const float opac          = xy_opac.z;
+            const float dx            = xy_opac.x - px;
 
 #    pragma unroll
             for(uint32_t p = 0; p < PIXELS_PER_THREAD; ++p)
@@ -236,7 +237,7 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
                 }
 
                 const float dy          = xy_opac.y - py[p];
-                const GaussianWeight gw = eval_gaussian_weight(conic, dx, dy, opac);
+                const GaussianWeight gw = eval_gaussian_weight<Mode>(params, dx, dy, opac);
                 if(!gw.valid)
                 {
                     continue;
@@ -308,6 +309,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
+    const RasterizeMode rasterize_mode,
     // intersections
     const at::Tensor isect_offsets, // [..., grid_h, grid_w]
     const at::Tensor flatten_ids,   // [n_isects]
@@ -342,49 +344,53 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
 
         auto launch_variant = [&]<uint32_t TILE_SIZE, uint32_t CTA_SIZE>()
         {
-            const dim3 threads       = dim3{CTA_SIZE, 1, 1};
-            const int64_t shmem_size = CTA_SIZE * (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3));
-
-            if(cudaFuncSetAttribute(
-                   rasterize_to_pixels_3dgs_fwd_kernel<CDIM, TILE_SIZE, CTA_SIZE>,
-                   cudaFuncAttributeMaxDynamicSharedMemorySize,
-                   shmem_size
-               )
-               != cudaSuccess)
+            auto launch_mode = [&]<RasterizeMode Mode>()
             {
-                AT_ERROR(
-                    "Failed to set maximum shared memory size (requested ",
-                    shmem_size,
-                    " bytes), try lowering tile_size."
-                );
-            }
+                using RasterParams       = GaussianRasterParams<Mode>;
+                const dim3 threads       = dim3{CTA_SIZE, 1, 1};
+                const int64_t shmem_size = CTA_SIZE * (sizeof(int32_t) + sizeof(vec3) + sizeof(RasterParams));
+                const float *bg_ptr   = backgrounds.has_value() ? backgrounds.value().const_data_ptr<float>() : nullptr;
+                const bool *masks_ptr = masks.has_value() ? masks.value().const_data_ptr<bool>() : nullptr;
 
-            const float *bg_ptr   = backgrounds.has_value() ? backgrounds.value().const_data_ptr<float>() : nullptr;
-            const bool *masks_ptr = masks.has_value() ? masks.value().const_data_ptr<bool>() : nullptr;
+                if(cudaFuncSetAttribute(
+                       rasterize_to_pixels_3dgs_fwd_kernel<Mode, CDIM, TILE_SIZE, CTA_SIZE>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       shmem_size
+                   )
+                   != cudaSuccess)
+                {
+                    AT_ERROR(
+                        "Failed to set maximum shared memory size (requested ",
+                        shmem_size,
+                        " bytes), try lowering tile_size."
+                    );
+                }
 
-            rasterize_to_pixels_3dgs_fwd_kernel<CDIM, TILE_SIZE, CTA_SIZE>
-                <<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
-                    N,
-                    n_isects,
-                    packed,
-                    reinterpret_cast<const vec2 *>(means2d.const_data_ptr<float>()),
-                    reinterpret_cast<const vec3 *>(conics.const_data_ptr<float>()),
-                    colors.const_data_ptr<float>(),
-                    opacities.const_data_ptr<float>(),
-                    bg_ptr,
-                    masks_ptr,
-                    image_width,
-                    image_height,
-                    I,
-                    grid_w,
-                    grid_h,
-                    0,
-                    isect_offsets.const_data_ptr<int32_t>(),
-                    flatten_ids.const_data_ptr<int32_t>(),
-                    renders.data_ptr<float>(),
-                    alphas.data_ptr<float>(),
-                    last_ids.data_ptr<int32_t>()
-                );
+                rasterize_to_pixels_3dgs_fwd_kernel<Mode, CDIM, TILE_SIZE, CTA_SIZE>
+                    <<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
+                        N,
+                        n_isects,
+                        packed,
+                        reinterpret_cast<const vec2 *>(means2d.const_data_ptr<float>()),
+                        reinterpret_cast<const vec3 *>(conics.const_data_ptr<float>()),
+                        colors.const_data_ptr<float>(),
+                        opacities.const_data_ptr<float>(),
+                        bg_ptr,
+                        masks_ptr,
+                        image_width,
+                        image_height,
+                        I,
+                        grid_w,
+                        grid_h,
+                        0,
+                        isect_offsets.const_data_ptr<int32_t>(),
+                        flatten_ids.const_data_ptr<int32_t>(),
+                        renders.data_ptr<float>(),
+                        alphas.data_ptr<float>(),
+                        last_ids.data_ptr<int32_t>()
+                    );
+            };
+            dispatch_rasterize_mode(rasterize_mode, launch_mode);
         };
 
         // NOTE: Here we need to support tile_size=4 temporarily, because test_basic.py
@@ -427,6 +433,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernels(
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
+    const RasterizeMode rasterize_mode,
     // intersections
     const at::Tensor isect_offsets, // [..., grid_h, grid_w]
     const at::Tensor flatten_ids,   // [n_isects]
@@ -460,61 +467,65 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernels(
 
         auto launch_variant = [&]<uint32_t TILE_SIZE, uint32_t CTA_SIZE>()
         {
-            const dim3 threads       = dim3{CTA_SIZE, 1, 1};
-            const int64_t shmem_size = CTA_SIZE * (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3));
-
-            const float *bg_ptr   = backgrounds.has_value() ? backgrounds.value().const_data_ptr<float>() : nullptr;
-            const bool *masks_ptr = masks.has_value() ? masks.value().const_data_ptr<bool>() : nullptr;
-
-            for(const auto device_id: c10::irange(c10::cuda::device_count()))
+            auto launch_mode = [&]<RasterizeMode Mode>()
             {
-                C10_CUDA_CHECK(cudaSetDevice(device_id));
-                if(cudaFuncSetAttribute(
-                       rasterize_to_pixels_3dgs_fwd_kernel<CDIM, TILE_SIZE, CTA_SIZE>,
-                       cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       shmem_size
-                   )
-                   != cudaSuccess)
-                {
-                    AT_ERROR(
-                        "Failed to set maximum shared memory size (requested ",
-                        shmem_size,
-                        " bytes), try lowering tile_size."
-                    );
-                }
-                auto stream = c10::cuda::getCurrentCUDAStream(device_id);
+                using RasterParams       = GaussianRasterParams<Mode>;
+                const dim3 threads       = dim3{CTA_SIZE, 1, 1};
+                const int64_t shmem_size = CTA_SIZE * (sizeof(int32_t) + sizeof(vec3) + sizeof(RasterParams));
+                const float *bg_ptr   = backgrounds.has_value() ? backgrounds.value().const_data_ptr<float>() : nullptr;
+                const bool *masks_ptr = masks.has_value() ? masks.value().const_data_ptr<bool>() : nullptr;
 
-                int64_t block_offset, block_count;
-                std::tie(block_offset, block_count) = chunk(n_tiles, device_id);
-                if(block_count > 0)
+                for(const auto device_id: c10::irange(c10::cuda::device_count()))
                 {
-                    const dim3 grid = {static_cast<uint32_t>(block_count), 1, 1};
-                    rasterize_to_pixels_3dgs_fwd_kernel<CDIM, TILE_SIZE, CTA_SIZE>
-                        <<<grid, threads, shmem_size, stream>>>(
-                            N,
-                            n_isects,
-                            packed,
-                            reinterpret_cast<const vec2 *>(means2d.const_data_ptr<float>()),
-                            reinterpret_cast<const vec3 *>(conics.const_data_ptr<float>()),
-                            colors.const_data_ptr<float>(),
-                            opacities.const_data_ptr<float>(),
-                            bg_ptr,
-                            masks_ptr,
-                            image_width,
-                            image_height,
-                            I,
-                            grid_w,
-                            grid_h,
-                            block_offset,
-                            isect_offsets.const_data_ptr<int32_t>(),
-                            flatten_ids.const_data_ptr<int32_t>(),
-                            renders.data_ptr<float>(),
-                            alphas.data_ptr<float>(),
-                            last_ids.data_ptr<int32_t>()
+                    C10_CUDA_CHECK(cudaSetDevice(device_id));
+                    if(cudaFuncSetAttribute(
+                           rasterize_to_pixels_3dgs_fwd_kernel<Mode, CDIM, TILE_SIZE, CTA_SIZE>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           shmem_size
+                       )
+                       != cudaSuccess)
+                    {
+                        AT_ERROR(
+                            "Failed to set maximum shared memory size (requested ",
+                            shmem_size,
+                            " bytes), try lowering tile_size."
                         );
-                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+                    }
+                    auto stream = c10::cuda::getCurrentCUDAStream(device_id);
+
+                    int64_t block_offset, block_count;
+                    std::tie(block_offset, block_count) = chunk(n_tiles, device_id);
+                    if(block_count > 0)
+                    {
+                        const dim3 grid = {static_cast<uint32_t>(block_count), 1, 1};
+                        rasterize_to_pixels_3dgs_fwd_kernel<Mode, CDIM, TILE_SIZE, CTA_SIZE>
+                            <<<grid, threads, shmem_size, stream>>>(
+                                N,
+                                n_isects,
+                                packed,
+                                reinterpret_cast<const vec2 *>(means2d.const_data_ptr<float>()),
+                                reinterpret_cast<const vec3 *>(conics.const_data_ptr<float>()),
+                                colors.const_data_ptr<float>(),
+                                opacities.const_data_ptr<float>(),
+                                bg_ptr,
+                                masks_ptr,
+                                image_width,
+                                image_height,
+                                I,
+                                grid_w,
+                                grid_h,
+                                block_offset,
+                                isect_offsets.const_data_ptr<int32_t>(),
+                                flatten_ids.const_data_ptr<int32_t>(),
+                                renders.data_ptr<float>(),
+                                alphas.data_ptr<float>(),
+                                last_ids.data_ptr<int32_t>()
+                            );
+                        C10_CUDA_KERNEL_LAUNCH_CHECK();
+                    }
                 }
-            }
+            };
+            dispatch_rasterize_mode(rasterize_mode, launch_mode);
         };
 
         // One thread per pixel (CTA=256, PIXELS_PER_THREAD=1) at tile_size=16.

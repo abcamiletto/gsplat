@@ -1348,6 +1348,7 @@ def rasterize_to_pixels(
     masks: Optional[Tensor] = None,  # [..., tile_height, tile_width]
     packed: bool = False,
     absgrad: bool = False,
+    rasterize_mode: Literal["classic", "analytic"] = "classic",
 ) -> Tuple[Tensor, Tensor]:
     """Rasterizes Gaussians to pixels.
 
@@ -1367,6 +1368,8 @@ def rasterize_to_pixels(
         masks: Optional tile mask to skip rendering GS to masked tiles. [..., tile_height, tile_width]. Default: None.
         packed: If True, the input tensors are expected to be packed with shape [nnz, ...]. Default: False.
         absgrad: If True, the backward pass will compute a `.absgrad` attribute for `means2d`. Default: False.
+        rasterize_mode: Whether to sample at the pixel center or analytically
+            approximate the Gaussian integral over the pixel area. Default: "classic".
 
     Returns:
         A tuple:
@@ -1378,6 +1381,8 @@ def rasterize_to_pixels(
         backgrounds = backgrounds.contiguous()
     if masks is not None:
         masks = masks.contiguous()
+    if rasterize_mode not in ("classic", "analytic"):
+        raise ValueError(f"Unknown rasterize_mode: {rasterize_mode!r}")
 
     render_colors, render_alphas, means2d_absgrad, _last_ids = _make_lazy_cuda_func(
         "rasterize_to_pixels_3dgs"
@@ -1395,6 +1400,7 @@ def rasterize_to_pixels(
         flatten_ids.contiguous(),
         packed,
         absgrad,
+        1 if rasterize_mode == "analytic" else 0,
     )
     if absgrad:
         means2d.absgrad = means2d_absgrad
@@ -1868,6 +1874,7 @@ class RegisterRasterizeToPixels3DGS:
             flatten_ids,
             _packed,
             absgrad,
+            rasterize_mode,
         ) = inputs
         _render_colors, render_alphas, means2d_absgrad, last_ids = output
         # last_ids and the absgrad holder are forward-internal; the backward fills the
@@ -1877,6 +1884,7 @@ class RegisterRasterizeToPixels3DGS:
         ctx.height = image_height
         ctx.tile_size = tile_size
         ctx.absgrad = absgrad
+        ctx.rasterize_mode = rasterize_mode
         ctx.save_for_backward(
             means2d,
             conics,
@@ -1935,6 +1943,7 @@ class RegisterRasterizeToPixels3DGS:
             ctx.needs_input_grad[
                 4
             ],  # compute_v_backgrounds (backgrounds is input index 4)
+            ctx.rasterize_mode,
         )
         # The abs gradient is not a returned input grad; surface it by filling the
         # saved means2d.absgrad holder in place.
@@ -1954,6 +1963,7 @@ class RegisterRasterizeToPixels3DGS:
             None,  # flatten_ids
             None,  # packed
             None,  # absgrad
+            None,  # rasterize_mode
         )
 
 

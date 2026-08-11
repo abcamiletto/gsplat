@@ -28,30 +28,214 @@
 
 namespace gsplat
 {
-// Per-(gaussian, pixel) gaussian-weight evaluation shared by every 3DGS
-// conic-based kernel. Computes the Mahalanobis exponent from the conic and the
-// pixel offset (dx, dy) = (mean - pixel), the resulting alpha (clamped to
-// MAX_ALPHA), and whether the sample contributes. `valid == false` means the
-// caller skips this gaussian (negative exponent or sub-threshold alpha). `vis`
-// (== exp(-sigma)) is retained for the backward pass, which needs it directly.
+constexpr float ANALYTIC_CDF_LINEAR = 1.6f;
+constexpr float ANALYTIC_CDF_CUBIC  = 0.07f;
+constexpr float TWO_PI              = 6.283185307179586f;
+
+template<typename Function>
+void dispatch_rasterize_mode(const RasterizeMode mode, Function &function)
+{
+    if(mode == RasterizeMode::CLASSIC)
+    {
+        function.template operator()<RasterizeMode::CLASSIC>();
+    }
+    else
+    {
+        function.template operator()<RasterizeMode::ANALYTIC>();
+    }
+}
+
+template<RasterizeMode Mode>
+struct GaussianRasterParams;
+
+template<>
+struct GaussianRasterParams<RasterizeMode::CLASSIC>
+{
+    vec3 conic;
+};
+
+template<>
+struct GaussianRasterParams<RasterizeMode::ANALYTIC>
+{
+    vec3 conic;
+    vec4 frame; // sin(theta), cos(theta), sigma_major, sigma_minor
+};
+
+template<RasterizeMode Mode>
+__device__ __forceinline__ GaussianRasterParams<Mode> prepare_gaussian_raster_params(const vec3 &conic)
+{
+    if constexpr(Mode == RasterizeMode::CLASSIC)
+    {
+        return {conic};
+    }
+    else
+    {
+        const float center    = 0.5f * (conic.x + conic.z);
+        const float half_diff = 0.5f * (conic.x - conic.z);
+        const float radius    = hypotf(half_diff, conic.y);
+        const float theta     = 0.5f * atan2f(conic.y, half_diff);
+        float sin_theta;
+        float cos_theta;
+        sincosf(theta, &sin_theta, &cos_theta);
+        const float sigma_major = rsqrtf(center - radius);
+        const float sigma_minor = rsqrtf(center + radius);
+        return {
+            conic, {sin_theta, cos_theta, sigma_major, sigma_minor}
+        };
+    }
+}
+
+__device__ __forceinline__ float analytic_normal_cdf(const float x)
+{
+    const float polynomial = ANALYTIC_CDF_LINEAR * x + ANALYTIC_CDF_CUBIC * x * x * x;
+    return 0.5f * tanhf(0.5f * polynomial) + 0.5f;
+}
+
+struct AxisIntegral
+{
+    float value;
+    float v_position;
+    float v_sigma;
+};
+
+__device__ __forceinline__ AxisIntegral eval_axis_integral(const float position, const float sigma)
+{
+    const float upper     = (position + 0.5f) / sigma;
+    const float lower     = (position - 0.5f) / sigma;
+    const float cdf_upper = analytic_normal_cdf(upper);
+    const float cdf_lower = analytic_normal_cdf(lower);
+    const float dcdf_upper
+        = (ANALYTIC_CDF_LINEAR + 3.f * ANALYTIC_CDF_CUBIC * upper * upper) * cdf_upper * (1.0f - cdf_upper);
+    const float dcdf_lower
+        = (ANALYTIC_CDF_LINEAR + 3.f * ANALYTIC_CDF_CUBIC * lower * lower) * cdf_lower * (1.0f - cdf_lower);
+    const float cdf_delta = cdf_upper - cdf_lower;
+    return {
+        sigma * cdf_delta,
+        dcdf_upper - dcdf_lower,
+        cdf_delta - upper * dcdf_upper + lower * dcdf_lower,
+    };
+}
+
+template<RasterizeMode Mode>
+__device__ __forceinline__ float eval_gaussian_response(
+    const GaussianRasterParams<Mode> &params, const float dx, const float dy
+)
+{
+    if constexpr(Mode == RasterizeMode::CLASSIC)
+    {
+        const vec3 conic  = params.conic;
+        const float sigma = 0.5f * (conic.x * dx * dx + conic.z * dy * dy) + conic.y * dx * dy;
+        return sigma < 0.f ? -1.f : __expf(-sigma);
+    }
+    else
+    {
+        const float sin_theta = params.frame.x;
+        const float cos_theta = params.frame.y;
+        const float u         = -sin_theta * dx + cos_theta * dy;
+        const float v         = cos_theta * dx + sin_theta * dy;
+        const AxisIntegral iu = eval_axis_integral(u, params.frame.z);
+        const AxisIntegral iv = eval_axis_integral(v, params.frame.w);
+        return TWO_PI * iu.value * iv.value;
+    }
+}
+
+// Per-(gaussian, pixel) response shared by the forward and backward passes.
+// `response` is a center sample in classic mode and a pixel-area integral in
+// analytic mode; `valid` also applies the compositing alpha threshold.
 struct GaussianWeight
 {
-    float vis;   // __expf(-sigma)
-    float alpha; // min(MAX_ALPHA, opac * vis)
-    bool valid;  // sigma >= 0 and alpha >= ALPHA_THRESHOLD
+    float response;
+    float alpha;
+    bool valid;
 };
+
+template<RasterizeMode Mode>
+__device__ __forceinline__ GaussianWeight
+    eval_gaussian_weight(const GaussianRasterParams<Mode> &params, const float dx, const float dy, const float opac)
+{
+    const float response = eval_gaussian_response(params, dx, dy);
+    const float alpha    = min(MAX_ALPHA, opac * response);
+    GaussianWeight out;
+    out.response = response;
+    out.alpha    = alpha;
+    out.valid    = response >= 0.f && alpha >= ALPHA_THRESHOLD;
+    return out;
+}
 
 __device__ __forceinline__ GaussianWeight
     eval_gaussian_weight(const vec3 &conic, const float dx, const float dy, const float opac)
 {
-    const float sigma = 0.5f * (conic.x * dx * dx + conic.z * dy * dy) + conic.y * dx * dy;
-    const float vis   = __expf(-sigma);
-    const float alpha = min(MAX_ALPHA, opac * vis);
-    GaussianWeight out;
-    out.vis   = vis;
-    out.alpha = alpha;
-    out.valid = !(sigma < 0.f || alpha < ALPHA_THRESHOLD);
-    return out;
+    const auto params = prepare_gaussian_raster_params<RasterizeMode::CLASSIC>(conic);
+    return eval_gaussian_weight<RasterizeMode::CLASSIC>(params, dx, dy, opac);
+}
+
+template<RasterizeMode Mode>
+__device__ __forceinline__ void gaussian_response_vjp(
+    const GaussianRasterParams<Mode> &params,
+    const vec2 &delta,
+    const float response,
+    const float v_response,
+    vec3 &v_conic,
+    vec2 &v_delta
+)
+{
+    if constexpr(Mode == RasterizeMode::CLASSIC)
+    {
+        const vec3 conic    = params.conic;
+        const float v_sigma = -response * v_response;
+        v_conic             = {
+            0.5f * v_sigma * delta.x * delta.x,
+            v_sigma * delta.x * delta.y,
+            0.5f * v_sigma * delta.y * delta.y,
+        };
+        v_delta = {
+            v_sigma * (conic.x * delta.x + conic.y * delta.y),
+            v_sigma * (conic.y * delta.x + conic.z * delta.y),
+        };
+    }
+    else
+    {
+        const vec3 conic          = params.conic;
+        const float sin_theta     = params.frame.x;
+        const float cos_theta     = params.frame.y;
+        const float sigma_major   = params.frame.z;
+        const float sigma_minor   = params.frame.w;
+        const float u             = -sin_theta * delta.x + cos_theta * delta.y;
+        const float v             = cos_theta * delta.x + sin_theta * delta.y;
+        const AxisIntegral iu     = eval_axis_integral(u, sigma_major);
+        const AxisIntegral iv     = eval_axis_integral(v, sigma_minor);
+        const float v_u           = v_response * TWO_PI * iv.value * iu.v_position;
+        const float v_v           = v_response * TWO_PI * iu.value * iv.v_position;
+        const float v_sigma_major = v_response * TWO_PI * iv.value * iu.v_sigma;
+        const float v_sigma_minor = v_response * TWO_PI * iu.value * iv.v_sigma;
+
+        v_delta = {
+            -sin_theta * v_u + cos_theta * v_v,
+            cos_theta * v_u + sin_theta * v_v,
+        };
+
+        const float center        = 0.5f * (conic.x + conic.z);
+        const float half_diff     = 0.5f * (conic.x - conic.z);
+        const float radius_sq     = half_diff * half_diff + conic.y * conic.y;
+        const float radius        = sqrtf(radius_sq);
+        const float v_eigen_major = -0.5f * sigma_major * sigma_major * sigma_major * v_sigma_major;
+        const float v_eigen_minor = -0.5f * sigma_minor * sigma_minor * sigma_minor * v_sigma_minor;
+
+        float v_half_diff = 0.f;
+        float v_offdiag   = 0.f;
+        if(radius_sq > 1e-12f * center * center)
+        {
+            const float v_radius = v_eigen_minor - v_eigen_major;
+            const float v_theta  = -v * v_u + u * v_v;
+            v_half_diff          = half_diff / radius * v_radius - 0.5f * conic.y / radius_sq * v_theta;
+            v_offdiag            = conic.y / radius * v_radius + 0.5f * half_diff / radius_sq * v_theta;
+        }
+
+        const float v_center = v_eigen_major + v_eigen_minor;
+        v_conic.x            = 0.5f * (v_center + v_half_diff);
+        v_conic.z            = 0.5f * (v_center - v_half_diff);
+        v_conic.y            = v_offdiag;
+    }
 }
 
 // Forward: blend one gaussian into one pixel's running color/transmittance.
@@ -106,7 +290,7 @@ __device__ __forceinline__ void rasterize_to_pixels_3dgs_blend_bwd(
     const vec3 &conic,
     const vec2 &delta, // (mean.x - px, mean.y - py)
     const float opac,
-    const float vis, // __expf(-sigma)
+    const float response,
     const float alpha,
     const float *__restrict__ rgbs,       // rgbs_batch + t * CDIM
     const float *__restrict__ v_render_c, // [CDIM]
@@ -152,18 +336,17 @@ __device__ __forceinline__ void rasterize_to_pixels_3dgs_blend_bwd(
         }
         v_alpha += -T_final * ra * accum;
     }
-    if(opac * vis <= MAX_ALPHA)
+    if(opac * response <= MAX_ALPHA)
     {
-        const float v_sigma = -opac * vis * v_alpha;
-        v_conic_local
-            = {0.5f * v_sigma * delta.x * delta.x, v_sigma * delta.x * delta.y, 0.5f * v_sigma * delta.y * delta.y};
-        v_xy_local
-            = {v_sigma * (conic.x * delta.x + conic.y * delta.y), v_sigma * (conic.y * delta.x + conic.z * delta.y)};
+        const auto params = prepare_gaussian_raster_params<RasterizeMode::CLASSIC>(conic);
+        gaussian_response_vjp<RasterizeMode::CLASSIC>(
+            params, delta, response, opac * v_alpha, v_conic_local, v_xy_local
+        );
         if(compute_abs)
         {
             v_xy_abs_local = {abs(v_xy_local.x), abs(v_xy_local.y)};
         }
-        v_opacity_local = vis * v_alpha;
+        v_opacity_local = response * v_alpha;
     }
 #pragma unroll
     for(uint32_t k = 0; k < CDIM; ++k)

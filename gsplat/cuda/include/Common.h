@@ -87,6 +87,12 @@ enum RendererConfig
     PARALLEL_BATCH = 1,
 };
 
+enum class RasterizeMode : uint8_t
+{
+    CLASSIC  = 0,
+    ANALYTIC = 1,
+};
+
 #define N_THREADS_PACKED 256
 
 // CUDA caps grid.y (and grid.z) at 65535; only grid.x reaches 2^31 - 1. Kernels
