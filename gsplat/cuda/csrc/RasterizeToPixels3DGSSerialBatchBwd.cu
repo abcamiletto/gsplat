@@ -198,16 +198,26 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
             vec2 delta;
             float response;
             RasterParams params;
+            AnalyticGaussianResponse analytic_response;
 
             if(valid)
             {
-                params                  = params_batch[t];
-                vec3 xy_opac            = xy_opacity_batch[t];
-                opac                    = xy_opac.z;
-                delta                   = {xy_opac.x - px, xy_opac.y - py};
-                const GaussianWeight gw = eval_gaussian_weight<Mode>(params, delta.x, delta.y, opac);
-                response                = gw.response;
-                alpha                   = gw.alpha;
+                params       = params_batch[t];
+                vec3 xy_opac = xy_opacity_batch[t];
+                opac         = xy_opac.z;
+                delta        = {xy_opac.x - px, xy_opac.y - py};
+                GaussianWeight gw;
+                if constexpr(Mode == RasterizeMode::ANALYTIC)
+                {
+                    analytic_response = eval_analytic_gaussian_response(params, delta.x, delta.y);
+                    gw                = eval_gaussian_weight(analytic_response.value, opac);
+                }
+                else
+                {
+                    gw = eval_gaussian_weight<Mode>(params, delta.x, delta.y, opac);
+                }
+                response = gw.response;
+                alpha    = gw.alpha;
                 if(!gw.valid)
                 {
                     valid = false;
@@ -260,7 +270,16 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
 
                 if(opac * response <= MAX_ALPHA)
                 {
-                    gaussian_response_vjp<Mode>(params, delta, response, opac * v_alpha, v_conic_local, v_xy_local);
+                    if constexpr(Mode == RasterizeMode::ANALYTIC)
+                    {
+                        analytic_gaussian_response_vjp(
+                            params, delta, analytic_response, opac * v_alpha, v_conic_local, v_xy_local
+                        );
+                    }
+                    else
+                    {
+                        gaussian_response_vjp<Mode>(params, delta, response, opac * v_alpha, v_conic_local, v_xy_local);
+                    }
                     if(v_means2d_abs != nullptr)
                     {
                         v_xy_abs_local = {abs(v_xy_local.x), abs(v_xy_local.y)};

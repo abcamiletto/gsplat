@@ -96,6 +96,13 @@ struct AxisIntegral
     float v_sigma;
 };
 
+struct AnalyticGaussianResponse
+{
+    float value;
+    AxisIntegral axis_u;
+    AxisIntegral axis_v;
+};
+
 __device__ __forceinline__ AxisIntegral eval_axis_integral(const float position, const float sigma)
 {
     const float upper     = (position + 0.5f) / sigma;
@@ -112,6 +119,19 @@ __device__ __forceinline__ AxisIntegral eval_axis_integral(const float position,
         dcdf_upper - dcdf_lower,
         cdf_delta - upper * dcdf_upper + lower * dcdf_lower,
     };
+}
+
+__device__ __forceinline__ AnalyticGaussianResponse eval_analytic_gaussian_response(
+    const GaussianRasterParams<RasterizeMode::ANALYTIC> &params, const float dx, const float dy
+)
+{
+    const float u = -params.frame.x * dx + params.frame.y * dy;
+    const float v = params.frame.y * dx + params.frame.x * dy;
+    AnalyticGaussianResponse out;
+    out.axis_u = eval_axis_integral(u, params.frame.z);
+    out.axis_v = eval_axis_integral(v, params.frame.w);
+    out.value  = ANALYTIC_TWO_PI * out.axis_u.value * out.axis_v.value;
+    return out;
 }
 
 template<RasterizeMode Mode>
@@ -147,17 +167,18 @@ struct GaussianWeight
     bool valid;
 };
 
+__device__ __forceinline__ GaussianWeight eval_gaussian_weight(const float response, const float opac)
+{
+    const float alpha = min(MAX_ALPHA, opac * response);
+    return {response, alpha, response >= 0.f && alpha >= ALPHA_THRESHOLD};
+}
+
 template<RasterizeMode Mode>
 __device__ __forceinline__ GaussianWeight
     eval_gaussian_weight(const GaussianRasterParams<Mode> &params, const float dx, const float dy, const float opac)
 {
     const float response = eval_gaussian_response(params, dx, dy);
-    const float alpha    = min(MAX_ALPHA, opac * response);
-    GaussianWeight out;
-    out.response = response;
-    out.alpha    = alpha;
-    out.valid    = response >= 0.f && alpha >= ALPHA_THRESHOLD;
-    return out;
+    return eval_gaussian_weight(response, opac);
 }
 
 __device__ __forceinline__ GaussianWeight
@@ -165,6 +186,60 @@ __device__ __forceinline__ GaussianWeight
 {
     const auto params = prepare_gaussian_raster_params<RasterizeMode::CLASSIC>(conic);
     return eval_gaussian_weight<RasterizeMode::CLASSIC>(params, dx, dy, opac);
+}
+
+__device__ __forceinline__ void analytic_gaussian_response_vjp(
+    const GaussianRasterParams<RasterizeMode::ANALYTIC> &params,
+    const vec2 &delta,
+    const AnalyticGaussianResponse &response,
+    const float v_response,
+    vec3 &v_conic,
+    vec2 &v_delta
+)
+{
+    const vec3 conic          = params.conic;
+    const float sin_theta     = params.frame.x;
+    const float cos_theta     = params.frame.y;
+    const float sigma_major   = params.frame.z;
+    const float sigma_minor   = params.frame.w;
+    const float u             = -sin_theta * delta.x + cos_theta * delta.y;
+    const float v             = cos_theta * delta.x + sin_theta * delta.y;
+    const float v_u           = v_response * ANALYTIC_TWO_PI * response.axis_v.value * response.axis_u.v_position;
+    const float v_v           = v_response * ANALYTIC_TWO_PI * response.axis_u.value * response.axis_v.v_position;
+    const float v_sigma_major = v_response * ANALYTIC_TWO_PI * response.axis_v.value * response.axis_u.v_sigma;
+    const float v_sigma_minor = v_response * ANALYTIC_TWO_PI * response.axis_u.value * response.axis_v.v_sigma;
+
+    v_delta = {
+        -sin_theta * v_u + cos_theta * v_v,
+        cos_theta * v_u + sin_theta * v_v,
+    };
+
+    const float center             = 0.5f * (conic.x + conic.z);
+    const float half_diff          = 0.5f * (conic.x - conic.z);
+    const float radius_sq          = half_diff * half_diff + conic.y * conic.y;
+    const float radius             = sqrtf(radius_sq);
+    const float eigenvalue_large   = center + radius;
+    const float determinant        = fmaf(conic.x, conic.z, -conic.y * conic.y);
+    const float eigenvalue_small   = determinant / eigenvalue_large;
+    const float v_eigenvalue_small = eigenvalue_small > ANALYTIC_MIN_EIGENVALUE
+                                       ? -0.5f * sigma_major * sigma_major * sigma_major * v_sigma_major
+                                       : 0.f;
+    const float v_eigenvalue_large = -0.5f * sigma_minor * sigma_minor * sigma_minor * v_sigma_minor
+                                   - v_eigenvalue_small * eigenvalue_small / eigenvalue_large;
+    const float v_determinant      = v_eigenvalue_small / eigenvalue_large;
+
+    float v_half_diff = 0.f;
+    float v_offdiag   = 0.f;
+    if(radius_sq > 1e-12f * center * center)
+    {
+        const float v_theta = -v * v_u + u * v_v;
+        v_half_diff         = half_diff / radius * v_eigenvalue_large - 0.5f * conic.y / radius_sq * v_theta;
+        v_offdiag           = conic.y / radius * v_eigenvalue_large + 0.5f * half_diff / radius_sq * v_theta;
+    }
+
+    v_conic.x = 0.5f * (v_eigenvalue_large + v_half_diff) + conic.z * v_determinant;
+    v_conic.z = 0.5f * (v_eigenvalue_large - v_half_diff) + conic.x * v_determinant;
+    v_conic.y = v_offdiag - 2.f * conic.y * v_determinant;
 }
 
 template<RasterizeMode Mode>
@@ -193,51 +268,8 @@ __device__ __forceinline__ void gaussian_response_vjp(
     }
     else
     {
-        const vec3 conic          = params.conic;
-        const float sin_theta     = params.frame.x;
-        const float cos_theta     = params.frame.y;
-        const float sigma_major   = params.frame.z;
-        const float sigma_minor   = params.frame.w;
-        const float u             = -sin_theta * delta.x + cos_theta * delta.y;
-        const float v             = cos_theta * delta.x + sin_theta * delta.y;
-        const AxisIntegral iu     = eval_axis_integral(u, sigma_major);
-        const AxisIntegral iv     = eval_axis_integral(v, sigma_minor);
-        const float v_u           = v_response * ANALYTIC_TWO_PI * iv.value * iu.v_position;
-        const float v_v           = v_response * ANALYTIC_TWO_PI * iu.value * iv.v_position;
-        const float v_sigma_major = v_response * ANALYTIC_TWO_PI * iv.value * iu.v_sigma;
-        const float v_sigma_minor = v_response * ANALYTIC_TWO_PI * iu.value * iv.v_sigma;
-
-        v_delta = {
-            -sin_theta * v_u + cos_theta * v_v,
-            cos_theta * v_u + sin_theta * v_v,
-        };
-
-        const float center             = 0.5f * (conic.x + conic.z);
-        const float half_diff          = 0.5f * (conic.x - conic.z);
-        const float radius_sq          = half_diff * half_diff + conic.y * conic.y;
-        const float radius             = sqrtf(radius_sq);
-        const float eigenvalue_large   = center + radius;
-        const float determinant        = fmaf(conic.x, conic.z, -conic.y * conic.y);
-        const float eigenvalue_small   = determinant / eigenvalue_large;
-        const float v_eigenvalue_small = eigenvalue_small > ANALYTIC_MIN_EIGENVALUE
-                                           ? -0.5f * sigma_major * sigma_major * sigma_major * v_sigma_major
-                                           : 0.f;
-        const float v_eigenvalue_large = -0.5f * sigma_minor * sigma_minor * sigma_minor * v_sigma_minor
-                                       - v_eigenvalue_small * eigenvalue_small / eigenvalue_large;
-        const float v_determinant      = v_eigenvalue_small / eigenvalue_large;
-
-        float v_half_diff = 0.f;
-        float v_offdiag   = 0.f;
-        if(radius_sq > 1e-12f * center * center)
-        {
-            const float v_theta = -v * v_u + u * v_v;
-            v_half_diff         = half_diff / radius * v_eigenvalue_large - 0.5f * conic.y / radius_sq * v_theta;
-            v_offdiag           = conic.y / radius * v_eigenvalue_large + 0.5f * half_diff / radius_sq * v_theta;
-        }
-
-        v_conic.x = 0.5f * (v_eigenvalue_large + v_half_diff) + conic.z * v_determinant;
-        v_conic.z = 0.5f * (v_eigenvalue_large - v_half_diff) + conic.x * v_determinant;
-        v_conic.y = v_offdiag - 2.f * conic.y * v_determinant;
+        const AnalyticGaussianResponse analytic_response = eval_analytic_gaussian_response(params, delta.x, delta.y);
+        analytic_gaussian_response_vjp(params, delta, analytic_response, v_response, v_conic, v_delta);
     }
 }
 
