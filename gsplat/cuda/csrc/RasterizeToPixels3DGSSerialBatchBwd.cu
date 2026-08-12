@@ -34,11 +34,12 @@
 
 namespace gsplat
 {
-using SupportedChannels = dispatch::IntParam<GSPLAT_NUM_CHANNELS>;
+using SupportedChannels       = dispatch::IntParam<GSPLAT_NUM_CHANNELS>;
+using SupportedRasterizeModes = dispatch::IntParam<0, 1>;
 
 namespace cg = cooperative_groups;
 
-template<uint32_t CDIM, typename scalar_t>
+template<RasterizeMode Mode, uint32_t CDIM, typename scalar_t>
 __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     const uint32_t I,
     const uint32_t N,
@@ -126,10 +127,11 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     const uint32_t num_batches = (range_end - range_start + block_size - 1) / block_size;
 
     extern __shared__ int s[];
-    int32_t *id_batch      = (int32_t *)s;                                            // [block_size]
-    vec3 *xy_opacity_batch = reinterpret_cast<vec3 *>(&id_batch[block_size]);         // [block_size]
-    vec3 *conic_batch      = reinterpret_cast<vec3 *>(&xy_opacity_batch[block_size]); // [block_size]
-    float *rgbs_batch      = (float *)&conic_batch[block_size];                       // [block_size * CDIM]
+    int32_t *id_batch          = (int32_t *)s;                                    // [block_size]
+    vec3 *xy_opacity_batch     = reinterpret_cast<vec3 *>(&id_batch[block_size]); // [block_size]
+    using RasterParams         = GaussianRasterParams<Mode>;
+    RasterParams *params_batch = reinterpret_cast<RasterParams *>(&xy_opacity_batch[block_size]); // [block_size]
+    float *rgbs_batch          = (float *)&params_batch[block_size];                              // [block_size * CDIM]
 
     // this is the T AFTER the last gaussian in this pixel
     float T_final           = 1.0f - render_alphas[pix_id];
@@ -173,7 +175,7 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
             const vec2 xy        = means2d[g];
             const float opac     = opacities[g];
             xy_opacity_batch[tr] = {xy.x, xy.y, opac};
-            conic_batch[tr]      = conics[g];
+            params_batch[tr]     = prepare_gaussian_raster_params<Mode>(conics[g]);
 #    pragma unroll
             for(uint32_t k = 0; k < CDIM; ++k)
             {
@@ -194,18 +196,28 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
             float alpha;
             float opac;
             vec2 delta;
-            vec3 conic;
-            float vis;
+            float response;
+            RasterParams params;
+            AnalyticGaussianResponse analytic_response;
 
             if(valid)
             {
-                conic                   = conic_batch[t];
-                vec3 xy_opac            = xy_opacity_batch[t];
-                opac                    = xy_opac.z;
-                delta                   = {xy_opac.x - px, xy_opac.y - py};
-                const GaussianWeight gw = eval_gaussian_weight(conic, delta.x, delta.y, opac);
-                vis                     = gw.vis;
-                alpha                   = gw.alpha;
+                params       = params_batch[t];
+                vec3 xy_opac = xy_opacity_batch[t];
+                opac         = xy_opac.z;
+                delta        = {xy_opac.x - px, xy_opac.y - py};
+                GaussianWeight gw;
+                if constexpr(Mode == RasterizeMode::ANALYTIC)
+                {
+                    analytic_response = eval_analytic_gaussian_response(params, delta.x, delta.y);
+                    gw                = eval_gaussian_weight(analytic_response.value, opac);
+                }
+                else
+                {
+                    gw = eval_gaussian_weight<Mode>(params, delta.x, delta.y, opac);
+                }
+                response = gw.response;
+                alpha    = gw.alpha;
                 if(!gw.valid)
                 {
                     valid = false;
@@ -256,21 +268,23 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                     v_alpha += -T_final * ra * accum;
                 }
 
-                if(opac * vis <= MAX_ALPHA)
+                if(opac * response <= MAX_ALPHA)
                 {
-                    const float v_sigma = -opac * vis * v_alpha;
-                    v_conic_local
-                        = {0.5f * v_sigma * delta.x * delta.x,
-                           v_sigma * delta.x * delta.y,
-                           0.5f * v_sigma * delta.y * delta.y};
-                    v_xy_local
-                        = {v_sigma * (conic.x * delta.x + conic.y * delta.y),
-                           v_sigma * (conic.y * delta.x + conic.z * delta.y)};
+                    if constexpr(Mode == RasterizeMode::ANALYTIC)
+                    {
+                        analytic_gaussian_response_vjp(
+                            params, delta, analytic_response, opac * v_alpha, v_conic_local, v_xy_local
+                        );
+                    }
+                    else
+                    {
+                        gaussian_response_vjp<Mode>(params, delta, response, opac * v_alpha, v_conic_local, v_xy_local);
+                    }
                     if(v_means2d_abs != nullptr)
                     {
                         v_xy_abs_local = {abs(v_xy_local.x), abs(v_xy_local.y)};
                     }
-                    v_opacity_local = vis * v_alpha;
+                    v_opacity_local = response * v_alpha;
                 }
 
 #    pragma unroll
@@ -331,6 +345,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
+    const RasterizeMode rasterize_mode,
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
@@ -377,15 +392,18 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
         "in -DGSPLAT_NUM_CHANNELS=... (see gsplat/cuda/csrc/Config.h)."
     );
 
-    auto launch_kernel = [&]<typename ChannelsT>()
+    auto launch_kernel = [&]<typename ChannelsT, typename RasterizeModeT>()
     {
-        constexpr uint32_t CDIM = ChannelsT::value;
-
-        int64_t shmem_size
-            = tile_size * tile_size * (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3) + sizeof(float) * CDIM);
+        constexpr uint32_t CDIM      = ChannelsT::value;
+        constexpr RasterizeMode Mode = static_cast<RasterizeMode>(RasterizeModeT::value);
+        using RasterParams           = GaussianRasterParams<Mode>;
+        const int64_t shmem_size
+            = tile_size * tile_size * (sizeof(int32_t) + sizeof(vec3) + sizeof(RasterParams) + sizeof(float) * CDIM);
 
         if(cudaFuncSetAttribute(
-               rasterize_to_pixels_3dgs_bwd_kernel<CDIM, float>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size
+               rasterize_to_pixels_3dgs_bwd_kernel<Mode, CDIM, float>,
+               cudaFuncAttributeMaxDynamicSharedMemorySize,
+               shmem_size
            )
            != cudaSuccess)
         {
@@ -394,7 +412,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
             );
         }
 
-        rasterize_to_pixels_3dgs_bwd_kernel<CDIM, float>
+        rasterize_to_pixels_3dgs_bwd_kernel<Mode, CDIM, float>
             <<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
                 I,
                 N,
@@ -426,7 +444,9 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
             );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     };
-    const bool dispatched = dispatch::dispatch(SupportedChannels{channels}, std::move(launch_kernel));
+    const bool dispatched = dispatch::dispatch(
+        SupportedChannels{channels}, SupportedRasterizeModes{static_cast<int>(rasterize_mode)}, std::move(launch_kernel)
+    );
     TORCH_CHECK(dispatched, "dispatch failed: no matching compile-time instantiation for runtime parameters");
 }
 
@@ -442,6 +462,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernels(
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
+    const RasterizeMode rasterize_mode,
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
@@ -484,18 +505,19 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernels(
         "in -DGSPLAT_NUM_CHANNELS=... (see gsplat/cuda/csrc/Config.h)."
     );
 
-    auto launch_kernels = [&]<typename ChannelsT>()
+    auto launch_kernels = [&]<typename ChannelsT, typename RasterizeModeT>()
     {
-        constexpr uint32_t CDIM = ChannelsT::value;
-
-        int64_t shmem_size
-            = tile_size * tile_size * (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3) + sizeof(float) * CDIM);
+        constexpr uint32_t CDIM      = ChannelsT::value;
+        constexpr RasterizeMode Mode = static_cast<RasterizeMode>(RasterizeModeT::value);
+        using RasterParams           = GaussianRasterParams<Mode>;
+        const int64_t shmem_size
+            = tile_size * tile_size * (sizeof(int32_t) + sizeof(vec3) + sizeof(RasterParams) + sizeof(float) * CDIM);
 
         for(const auto device_id: c10::irange(c10::cuda::device_count()))
         {
             C10_CUDA_CHECK(cudaSetDevice(device_id));
             if(cudaFuncSetAttribute(
-                   rasterize_to_pixels_3dgs_bwd_kernel<CDIM, float>,
+                   rasterize_to_pixels_3dgs_bwd_kernel<Mode, CDIM, float>,
                    cudaFuncAttributeMaxDynamicSharedMemorySize,
                    shmem_size
                )
@@ -514,7 +536,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernels(
             if(block_count > 0)
             {
                 dim3 grid = {static_cast<uint32_t>(block_count), 1, 1};
-                rasterize_to_pixels_3dgs_bwd_kernel<CDIM, float><<<grid, threads, shmem_size, stream>>>(
+                rasterize_to_pixels_3dgs_bwd_kernel<Mode, CDIM, float><<<grid, threads, shmem_size, stream>>>(
                     I,
                     N,
                     n_isects,
@@ -548,7 +570,11 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernels(
             }
         }
     };
-    const bool dispatched = dispatch::dispatch(SupportedChannels{channels}, std::move(launch_kernels));
+    const bool dispatched = dispatch::dispatch(
+        SupportedChannels{channels},
+        SupportedRasterizeModes{static_cast<int>(rasterize_mode)},
+        std::move(launch_kernels)
+    );
     TORCH_CHECK(
         dispatched,
         "dispatch failed: no matching compile-time instantiation for runtime "

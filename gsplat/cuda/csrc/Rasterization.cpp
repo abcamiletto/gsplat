@@ -127,6 +127,17 @@ namespace
 
 namespace
 {
+    RasterizeMode parse_rasterize_mode(const int64_t value)
+    {
+        TORCH_CHECK_VALUE(
+            value == static_cast<int64_t>(RasterizeMode::CLASSIC)
+                || value == static_cast<int64_t>(RasterizeMode::ANALYTIC),
+            "rasterize_mode must be 0 (classic) or 1 (analytic), got ",
+            value
+        );
+        return static_cast<RasterizeMode>(value);
+    }
+
     void check_rasterize_to_pixels_3dgs_inputs(
         const at::Tensor &means2d,
         const at::Tensor &conics,
@@ -288,7 +299,8 @@ RasterizeToPixels3DGSFwdResult rasterize_to_pixels_3dgs_fwd(
     const at::Tensor &isect_offsets, // [..., tile_height, tile_width]
     const at::Tensor &flatten_ids,   // [n_isects]
     bool packed,
-    bool absgrad
+    bool absgrad,
+    int64_t rasterize_mode
 )
 {
     check_rasterize_to_pixels_3dgs_inputs(
@@ -347,6 +359,7 @@ RasterizeToPixels3DGSFwdResult rasterize_to_pixels_3dgs_fwd(
         image_width,
         image_height,
         tile_size,
+        parse_rasterize_mode(rasterize_mode),
         isect_offsets,
         flatten_ids,
         renders,
@@ -380,7 +393,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3
     const at::Tensor &isect_offsets, // [..., tile_height, tile_width]
     const at::Tensor &flatten_ids,   // [n_isects]
     bool packed,
-    bool absgrad
+    bool absgrad,
+    int64_t rasterize_mode
 )
 {
     check_rasterize_to_pixels_3dgs_inputs(
@@ -439,6 +453,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3
         image_width,
         image_height,
         tile_size,
+        parse_rasterize_mode(rasterize_mode),
         isect_offsets,
         flatten_ids,
         renders,
@@ -501,7 +516,8 @@ RasterizeToPixels3DGSBwdResult rasterize_to_pixels_3dgs_bwd(
     int64_t tile_size,
     bool absgrad,
     const RasterizeToPixels3DGSGrad &grad,
-    bool compute_v_backgrounds
+    bool compute_v_backgrounds,
+    int64_t rasterize_mode
 )
 {
     DEVICE_GUARD(means2d);
@@ -548,6 +564,7 @@ RasterizeToPixels3DGSBwdResult rasterize_to_pixels_3dgs_bwd(
         image_width,
         image_height,
         tile_size,
+        parse_rasterize_mode(rasterize_mode),
         tile_offsets,
         flatten_ids,
         render_alphas,
@@ -599,7 +616,8 @@ RasterizeToPixels3DGSResult rasterize_to_pixels_3dgs(
     const at::Tensor &isect_offsets,
     const at::Tensor &flatten_ids,
     bool packed,
-    bool absgrad
+    bool absgrad,
+    RasterizeMode rasterize_mode
 )
 {
     // Invoke the op through the dispatcher so its registered autograd is
@@ -620,7 +638,8 @@ RasterizeToPixels3DGSResult rasterize_to_pixels_3dgs(
         isect_offsets,
         flatten_ids,
         packed,
-        absgrad
+        absgrad,
+        static_cast<int64_t>(rasterize_mode)
     );
     return {
         .renders         = fwd.renders,
@@ -878,7 +897,8 @@ std::tuple<at::optional<at::Tensor>, at::Tensor, at::Tensor, at::Tensor, at::Ten
         // gradients of outputs
         const at::Tensor &v_render_colors, // [..., image_height, image_width, channels]
         const at::Tensor &v_render_alphas, // [..., image_height, image_width, 1]
-        bool compute_v_backgrounds
+        bool compute_v_backgrounds,
+        int64_t rasterize_mode
     )
 {
     DEVICE_GUARD(means2d);
@@ -921,6 +941,7 @@ std::tuple<at::optional<at::Tensor>, at::Tensor, at::Tensor, at::Tensor, at::Ten
         image_width,
         image_height,
         tile_size,
+        parse_rasterize_mode(rasterize_mode),
         tile_offsets,
         flatten_ids,
         render_alphas,

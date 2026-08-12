@@ -122,6 +122,7 @@ namespace
         bool absgrad,
         bool calc_compensations,
         bool classic_rasterize_mode,
+        bool analytic_rasterize_mode,
         int64_t channel_chunk,
         CameraModelType camera_model,
         const at::optional<c10::intrusive_ptr<RowOffsetStructuredSpinningLidarModelParametersExt>> &lidar_coeffs,
@@ -234,6 +235,14 @@ namespace
         }
 
         const bool is_lidar_camera = camera_model == CameraModelType::LIDAR;
+        TORCH_CHECK(
+            !analytic_rasterize_mode || !classic_rasterize_mode,
+            "Analytic rasterization cannot also be marked as classic"
+        );
+        TORCH_CHECK(
+            !calc_compensations || !analytic_rasterize_mode,
+            "Analytic rasterization cannot be combined with antialiased opacity compensation"
+        );
         TORCH_CHECK(
             has_color || append_depth,
             "Unsupported render_mode. Expected one of RGB, d, Ed, D, ED, "
@@ -856,7 +865,8 @@ Rasterization3DGSResult rasterization_3dgs(
     bool return_normals,
     int64_t renderer_config,
     const at::optional<std::string> &process_group_name,
-    int64_t world_size
+    int64_t world_size,
+    bool analytic_rasterize_mode
 )
 {
     DEVICE_GUARD(means);
@@ -894,6 +904,7 @@ Rasterization3DGSResult rasterization_3dgs(
         absgrad,
         calc_compensations,
         rasterize_mode_is_classic,
+        analytic_rasterize_mode,
         channel_chunk,
         camera_model,
         lidar_coeffs,
@@ -1491,7 +1502,8 @@ Rasterization3DGSResult rasterization_3dgs(
                 raster_isect_offsets,
                 raster_flatten_ids,
                 packed,
-                absgrad
+                absgrad,
+                analytic_rasterize_mode ? RasterizeMode::ANALYTIC : RasterizeMode::CLASSIC
             );
             render_color_chunks.push_back(raster.renders);
             if(!render_alphas.defined())

@@ -185,7 +185,7 @@ __global__ void rasterize_to_pixels_sparse_bwd_kernel(
             float opac;
             vec2 delta;
             vec3 conic;
-            float vis;
+            float response;
 
             if(valid)
             {
@@ -194,7 +194,7 @@ __global__ void rasterize_to_pixels_sparse_bwd_kernel(
                 opac                    = xy_opac.z;
                 delta                   = {xy_opac.x - px, xy_opac.y - py};
                 const GaussianWeight gw = eval_gaussian_weight(conic, delta.x, delta.y, opac);
-                vis                     = gw.vis;
+                response                = gw.response;
                 alpha                   = gw.alpha;
                 if(!gw.valid)
                 {
@@ -219,7 +219,7 @@ __global__ void rasterize_to_pixels_sparse_bwd_kernel(
                     conic,
                     delta,
                     opac,
-                    vis,
+                    response,
                     alpha,
                     rgbs_batch + t * CDIM,
                     v_render_c,

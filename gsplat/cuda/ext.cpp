@@ -1062,13 +1062,14 @@ TORCH_LIBRARY(gsplat, m)
     m.def(
         "rasterize_to_pixels_3dgs(Tensor means2d, Tensor conics, Tensor colors, Tensor opacities, Tensor? backgrounds, "
         "Tensor? masks, int image_width, int image_height, int tile_size, Tensor isect_offsets, Tensor flatten_ids, "
-        "bool packed, bool absgrad) -> (Tensor, Tensor, Tensor, Tensor)"
+        "bool packed, bool absgrad, int rasterize_mode=0) -> (Tensor, Tensor, Tensor, Tensor)"
     );
     m.def(
         "rasterize_to_pixels_3dgs_bwd(Tensor means2d, Tensor conics, Tensor colors, Tensor opacities, Tensor? "
         "backgrounds, Tensor? masks, Tensor tile_offsets, Tensor flatten_ids, Tensor render_alphas, Tensor last_ids, "
         "int image_width, int image_height, int tile_size, bool absgrad, Tensor v_render_colors, Tensor "
-        "v_render_alphas, bool compute_v_backgrounds) -> (Tensor?, Tensor, Tensor, Tensor, Tensor, Tensor?)"
+        "v_render_alphas, bool compute_v_backgrounds, int rasterize_mode=0) -> (Tensor?, Tensor, Tensor, Tensor, "
+        "Tensor, Tensor?)"
     );
     m.def(
         "rasterize_to_pixels_sparse(Tensor means2d, Tensor conics, Tensor colors, Tensor opacities, Tensor? "
@@ -1137,7 +1138,8 @@ TORCH_LIBRARY(gsplat, m)
         "__torch__.torch.classes.gsplat.RowOffsetStructuredSpinningLidarModelParametersExt? lidar_coeffs, "
         "__torch__.torch.classes.gsplat.BivariateWindshieldModelParameters? external_distortion_params, bool "
         "global_z_order, bool use_hit_distance, bool return_normals, int renderer_config, str? process_group_name, int "
-        "world_size) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, "
+        "world_size, bool analytic_rasterize_mode=False) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, "
+        "Tensor, Tensor, Tensor, Tensor, "
         "Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, int, int)"
     );
 #endif
